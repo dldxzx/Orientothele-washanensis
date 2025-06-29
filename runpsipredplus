@@ -1,0 +1,119 @@
+#!/bin/tcsh
+
+# This is a modified script to handle short sequences in PSIPRED V3
+# Adjusted parameters:
+# - Reduced minimum sequence length check
+# - Modified PSI-BLAST parameters for short sequences
+# - Added unique temporary file handling
+
+# The name of the BLAST+ data bank
+set dbname = /home/dwf/database/uniref50.fasta
+
+# Where the NCBI BLAST+ programs have been installed
+set ncbidir = /home/dwf/blast/ncbi-blast-2.16.0+/bin
+
+# Where the PSIPRED V3 programs have been installed
+set execdir = /home/dwf/psipred/bin
+
+# Where the PSIPRED V3 data files have been installed
+set datadir = /home/dwf/psipred/data
+
+set basename = $1:r
+set rootname = $basename:t
+
+# Check if input file exists
+if (! -e "$1") then
+    echo "ERROR: Input file $1 does not exist!"
+    exit 1
+endif
+
+# Check sequence length
+set seqlen = `grep -v ">" $1 | tr -d '\n' | wc -c`
+echo "Sequence length: $seqlen residues"
+
+# Generate a truly unique temporary filename root
+set hostid = `hostid`
+set timestamp = `date +%s`
+set tmproot = psitmp_${rootname}_${timestamp}_$$_$hostid
+
+\cp -f $1 $tmproot.fasta
+
+echo "Running PSI-BLAST with sequence" $1 "..."
+
+# Adjusted PSI-BLAST parameters for short sequences
+if ($seqlen < 60) then
+    echo "Short sequence detected (<60 residues). Using adjusted PSI-BLAST parameters."
+    
+    # 短序列专用参数: 降低E值阈值，增加敏感型
+    psiblast -db $dbname -query $tmproot.fasta -inclusion_ethresh 0.001 -evalue 0.01 \
+        -out_pssm $tmproot.chk -num_iterations 3 -num_alignments 1000 -num_descriptions 1000 \
+        -seg no -comp_based_stats 0 >& $tmproot.blast
+else
+    # 长序列标准参数
+    psiblast -db $dbname -query $tmproot.fasta -inclusion_ethresh 1 -evalue 10000 \
+        -out_pssm $tmproot.chk -num_iterations 5 -num_alignments 5000 -num_descriptions 5000 >& $tmproot.blast
+endif
+
+if ($status != 0) then
+    tail $tmproot.blast
+    echo "FATAL: Error whilst running psiblast - script terminated!"
+    exit $status
+endif
+
+# 检查PSSM文件是否生成且非空
+if (! -e "$tmproot.chk" || ! -s "$tmproot.chk") then
+    echo "ERROR: PSSM file $tmproot.chk is empty or not generated!"
+    echo "检查PSI-BLAST输出以获取更多信息: $tmproot.blast"
+    
+    # 尝试使用简化的PSSM生成方法
+    echo "尝试使用简化的PSSM生成方法..."
+    $execdir/makemat -F $tmproot.fasta > $tmproot.mtx
+    
+    if ($status != 0 || ! -s "$tmproot.mtx") then
+        echo "FATAL: 无法生成替代的MTX文件 - 终止!"
+        exit 1
+    else
+        echo "已生成替代的MTX文件，继续进行预测..."
+        set use_alternate_mtx = 1
+    endif
+else
+    set use_alternate_mtx = 0
+endif
+
+# 如果没有使用替代方法，则运行chkparse
+if ($use_alternate_mtx == 0) then
+    echo "Processing PSSM file with chkparse..."
+    $execdir/chkparse $tmproot.chk > $tmproot.mtx
+
+    if ($status != 0) then
+        echo "FATAL: Error whilst running chkparse - script terminated!"
+        echo "检查PSSM文件: $tmproot.chk"
+        exit $status
+    endif
+endif
+
+echo "Predicting secondary structure..."
+
+$execdir/psipred $tmproot.mtx $datadir/weights.dat $datadir/weights.dat2 $datadir/weights.dat3 > $rootname.ss
+
+if ($status != 0) then
+    echo "FATAL: Error whilst running psipred - script terminated!"
+    exit $status
+endif
+
+echo "Generating horizontal output..."
+
+$execdir/psipass2 $datadir/weights_p2.dat 1 1.0 1.0 $rootname.ss2 $rootname.ss > $rootname.horiz
+
+if ($status != 0) then
+    echo "FATAL: Error whilst running psipass2 - script terminated!"
+    exit $status
+endif
+
+# Remove temporary files, but keep BLAST output for debugging
+echo "Cleaning up temporary files..."
+\rm -f $tmproot.fasta $tmproot.chk $tmproot.mtx $tmproot.ss error.log
+
+echo "Final output files:" $rootname.ss $rootname.ss2 $rootname.horiz
+echo "BLAST output saved as:" $tmproot.blast
+echo "Finished."
